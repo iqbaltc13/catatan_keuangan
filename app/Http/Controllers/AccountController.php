@@ -3,94 +3,66 @@
 namespace App\Http\Controllers;
 
 use App\Models\Account;
+use App\Models\Transaction;
+use App\Support\AmountParser;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
-use Illuminate\View\View;
 
 class AccountController extends Controller
 {
-    /**
-     * Display a listing of the resource.
-     */
-    public function index(): View
+    public function index()
     {
-        $accounts = Account::All();
-        return view('account.index', compact('accounts'));
+        return view('account.index', ['accounts' => Account::withBalances()->get()]);
     }
 
-    /**
-     * Show the form for creating a new resource.
-     */
-    public function create(): View
+    public function create()
     {
-        return view('account.create');
+        return view('account.form', ['account' => null]);
     }
 
-    /**
-     * Store a newly created resource in storage.
-     */
     public function store(Request $request)
     {
-        $request->validate([
-            'name' => ['required', 'string', 'max:255', 'unique:accounts'],
-            'descriptions' => 'required',
-        ]);
-
-        Account::create([
-            'name'    => $request->get('name'),
-            'descriptions'    => $request->get('descriptions')
-        ]);
-
-        return redirect()->route('account')->with('success', 'Selamat, Data berhasil di tambahkan!');
+        Account::create($this->validated($request));
+        return redirect()->route('account')->with('success', 'Akun berhasil ditambahkan!');
     }
 
-    /**
-     * Display the specified resource.
-     */
-    public function show(string $id)
+    public function edit(string $id)
     {
-        //
+        return view('account.form', ['account' => Account::findOrFail($id)]);
     }
 
-    /**
-     * Show the form for editing the specified resource.
-     */
-    public function edit(string $id): View
-    {
-      $account = Account::find($id);
-      return view('account.edit', compact('account'));
-    }
-
-    /**
-     * Update the specified resource in storage.
-     */
     public function update(Request $request, string $id)
     {
-      $request->validate([
-          'name'          => [
-              'required', 'string', 'max:255',
-              Rule::unique('accounts', 'name')->ignore($id),
-          ],
-          'descriptions'  => ['nullable', 'string']
-      ]);
-
-      $account = Account::findOrFail($id);
-      $account->update([
-          'name'          => $request->input('name'),
-          'descriptions'  => $request->input('descriptions'),
-      ]);
-
-      return redirect()->route('account')->with('success', 'Data Berhasil diubah');
+        $account = Account::findOrFail($id);
+        $account->update($this->validated($request, $account->id));
+        return redirect()->route('account')->with('success', 'Akun berhasil diubah');
     }
 
-    /**
-     * Remove the specified resource from storage.
-     */
     public function destroy(string $id)
     {
-      $account = Account::find($id);
-      $account->delete();
+        $used = Transaction::where('account_id', $id)->orWhere('target_account_id', $id)->exists();
+        if ($used) {
+            return back()->withErrors(['account' => 'Akun sudah dipakai transaksi, tidak bisa dihapus.']);
+        }
+        Account::findOrFail($id)->delete();
+        return redirect()->route('account')->with('success', 'Akun berhasil dihapus!');
+    }
 
-      return redirect()->route('account')->with('success', 'Data Berhasil dihapus!');
+    private function validated(Request $request, ?int $ignoreId = null): array
+    {
+        $request->merge(['opening_balance' => $request->filled('opening_balance')
+            ? AmountParser::parse(str_replace('-', '', $request->input('opening_balance'))) * ($this->isNegative($request->input('opening_balance')) ? -1 : 1)
+            : 0]);
+
+        return $request->validate([
+            'name'            => ['required', 'string', 'max:255', Rule::unique('accounts', 'name')->ignore($ignoreId)],
+            'descriptions'    => ['nullable', 'string'],
+            'opening_balance' => ['required', 'integer'],
+        ]);
+    }
+
+    private function isNegative(mixed $v): bool
+    {
+        return str_starts_with(trim((string) $v), '-');
     }
 }

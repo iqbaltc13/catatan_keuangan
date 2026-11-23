@@ -2,15 +2,15 @@
 
 namespace App\Http\Controllers;
 
-use App\Imports\TransactionImport;
+use App\Exports\TemplateExport;
+use App\Imports\TransactionsImport;
 use App\Models\Account;
-use App\Models\Balance;
 use App\Models\Category;
 use App\Models\Transaction;
-use Carbon\Carbon;
+use App\Support\AmountParser;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 use Illuminate\View\View;
 use Maatwebsite\Excel\Facades\Excel;
 
@@ -18,236 +18,113 @@ class TransactionController extends Controller
 {
     public function index(Request $request): View
     {
-        setlocale(LC_TIME, 'id_ID');
-        Carbon::setLocale('id');
-        $tglSekarang = Carbon::now()->toDateString();
-
-        $transactions = Transaction::with('account', 'category', 'user')
-            ->whereDate('date', $tglSekarang);
-
-        if ($request->filled('kategori')) {
-            $kategori = $request->kategori;
-
-            $isAccount = Account::where('name', $kategori)->exists();
-
-            if ($isAccount) {
-                $transactions->whereHas('account', function ($q) use ($kategori) {
-                    $q->where('name', $kategori);
-                });
-            } else {
-                $transactions->whereHas('category', function ($q) use ($kategori) {
-                    $q->where('name', $kategori);
-                });
-            }
-        }
-
-        $transactions = $transactions->orderByDesc('created_at')->get();
-
-        $balances = Balance::with('account')->get();
-        $chartData = [
-            'labels' => $balances->pluck('account.name')->toArray(),
-            'data'   => $balances->pluck('balance')->toArray(),
-            'total'  => $balances->sum('balance')
-        ];
-
-        $incomes = Transaction::where('type', 'pemasukan')
-            ->whereDate('date', $tglSekarang)
-            ->with('category')
-            ->selectRaw('category_id, SUM(amount) as total')
-            ->groupBy('category_id')
-            ->get();
-
-        $chartIncomeData = [
-            'labels' => $incomes->pluck('category.name')->toArray(),
-            'data'   => $incomes->pluck('total')->toArray(),
-        ];
-
-        $salaryCategoryId = Category::where('name', 'gaji')->value('id');
-
-        $expenses = Transaction::where('type', 'pengeluaran')
-            ->where('category_id', '!=', $salaryCategoryId)
-            ->whereDate('date', $tglSekarang)
-            ->with('category')
-            ->selectRaw('category_id, SUM(amount) as total')
-            ->groupBy('category_id')
-            ->get();
-
-        $chartExpenseData = [
-            'labels' => $expenses->pluck('category.name')->toArray(),
-            'data'   => $expenses->pluck('total')->toArray(),
-        ];
+        $query = Transaction::query()
+            ->with(['account', 'targetAccount', 'category', 'telegramMessage:id,text,sender_name'])
+            ->when($request->from, fn ($q, $d) => $q->whereDate('date', '>=', $d))
+            ->when($request->to, fn ($q, $d) => $q->whereDate('date', '<=', $d))
+            ->when($request->type, fn ($q, $v) => $q->where('type', $v))
+            ->when($request->account_id, fn ($q, $v) => $q->where(fn ($w) => $w->where('account_id', $v)->orWhere('target_account_id', $v)))
+            ->when($request->category_id, fn ($q, $v) => $q->where('category_id', $v))
+            ->when($request->source, fn ($q, $v) => $q->where('source', $v))
+            ->when($request->search, fn ($q, $s) => $q->where(fn ($w) => $w
+                ->where('title', 'ilike', "%{$s}%")->orWhere('descriptions', 'ilike', "%{$s}%")));
 
         return view('transaksi.index', [
-            'transactions'     => $transactions,
-            'hari'             => Carbon::now()->translatedFormat('l, d F Y'),
-            'totalBalance'     => $chartData['total'],
-            'chartData'        => $chartData,
-            'chartIncomeData'  => $chartIncomeData,
-            'chartExpenseData' => $chartExpenseData,
-            'totalIncome'      => Transaction::where('type', 'pemasukan')->whereDate('date', $tglSekarang)->sum('amount'),
-            'totalExpense'     => Transaction::where('type', 'pengeluaran')->whereDate('date', $tglSekarang)->sum('amount'),
-            'kategoriDipilih'  => $request->kategori ?? null,
+            'transactions' => (clone $query)->orderByDesc('date')->orderByDesc('id')->paginate(30)->withQueryString(),
+            'totalIncome'  => (clone $query)->where('type', Transaction::IN)->sum('amount'),
+            'totalExpense' => (clone $query)->where('type', Transaction::OUT)->sum('amount'),
+            'filters'      => $request->only('from', 'to', 'type', 'account_id', 'category_id', 'source', 'search'),
+            'accounts'     => Account::orderBy('name')->get(['id', 'name']),
+            'categories'   => Category::orderBy('type')->orderBy('name')->get(['id', 'name', 'type']),
         ]);
     }
-
 
     public function create(): View
     {
-        $accounts = Account::all();
-        $categories = Category::all();
-
-        return view('transaksi.create', [
-            'accounts'      => $accounts,
-            'categories'    => $categories
-        ]);
+        return view('transaksi.form', $this->formData(null));
     }
 
-    /**
-     * Store a newly created resource in storage.
-     */
     public function store(Request $request): RedirectResponse
     {
-        $validatedData = $request->validate([
-            'date' => 'required|date',
-            'type' => 'required|in:pemasukan,pengeluaran,pindah',
-            'account_id' => 'required|exists:accounts,id',
-            'target_account_id' => 'nullable|exists:accounts,id|required_if:type,pindah',
-            'category_id' => 'required|exists:categories,id',
-            'amount' => 'required|numeric|min:0.01',
-            'descriptions' => 'nullable|string',
-        ]);
-
-        // Ambil saldo akun asal
-        $balance = Balance::firstOrCreate(
-            ['account_id' => $validatedData['account_id']],
-            ['balance' => 0]
-        );
-
-        // Hitung saldo setelah transaksi
-        $newBalance = match ($validatedData['type']) {
-            'pemasukan' => $balance->balance + $validatedData['amount'],
-            'pengeluaran' => $balance->balance - $validatedData['amount'],
-            'pindah' => $balance->balance - $validatedData['amount'],
-        };
-
-        // Simpan transaksi
-        $transaction = Transaction::create(array_merge($validatedData, [
-            'user_id' => auth()->id(),
-        ]));
-
-        // Update saldo akun asal
-        $balance->update(['balance' => $newBalance]);
-
-        // Update saldo akun tujuan jika pindah saldo
-        if ($validatedData['type'] === 'pindah') {
-            $targetBalance = Balance::firstOrCreate(
-                ['account_id' => $validatedData['target_account_id']],
-                ['balance' => 0]
-            );
-            $targetBalance->update(['balance' => $targetBalance->balance + $validatedData['amount']]);
-        }
-
+        Transaction::create($this->validated($request) + ['user_id' => auth()->id(), 'source' => 'manual']);
         return redirect()->route('transaksi')->with('success', 'Transaksi berhasil disimpan!');
     }
 
-    /**
-     * Display the specified resource.
-     */
-    public function show(string $id)
-    {
-        //
-    }
-
-    /**
-     * Show the form for editing the specified resource.
-     */
     public function edit(string $id): View
     {
-      $transaction = Transaction::find($id);
-      $accounts = Account::all();
-      $categories = Category::all();
-      return view('transaksi.edit', compact(
-          'transaction',
-          'accounts',
-          'categories'
-      ));
+        return view('transaksi.form', $this->formData(Transaction::findOrFail($id)));
     }
 
+    public function update(Request $request, string $id): RedirectResponse
+    {
+        $transaction = Transaction::findOrFail($id);
+        $data = $this->validated($request);
+        // hasil Telegram yang diedit manual tidak akan ditimpa saat parse ulang
+        $transaction->update($data + ['is_locked' => $transaction->source === 'telegram' ? true : $transaction->is_locked]);
 
-  public function update(Request $request, $id): RedirectResponse
-  {
-    $request->validate([
-        'date' => 'required|date',
-        'type' => 'required|in:pemasukan,pengeluaran,pindah',
-        'account_id' => 'required|exists:accounts,id',
-        'category_id' => 'required|exists:categories,id',
-        'target_account_id' => 'nullable|exists:accounts,id',
-        'amount' => 'required|numeric|min:0',
-        'descriptions' => 'nullable|string',
-    ]);
-
-    $transaction = Transaction::findOrFail($id);
-    $oldAmount = $transaction->amount;
-    $oldType = $transaction->type;
-    $oldAccount = $transaction->account_id;
-    $oldTargetAccount = $transaction->target_account_id;
-
-    DB::transaction(function () use ($request, $transaction, $oldAmount, $oldType, $oldAccount, $oldTargetAccount) {
-      // Kembalikan saldo ke keadaan sebelum transaksi lama
-      if ($oldType === 'pemasukan') {
-        Balance::where('account_id', $oldAccount)->decrement('balance', $oldAmount);
-      } elseif ($oldType === 'pengeluaran') {
-        Balance::where('account_id', $oldAccount)->increment('balance', $oldAmount);
-      } elseif ($oldType === 'pindah') {
-        Balance::where('account_id', $oldAccount)->increment('balance', $oldAmount);
-        Balance::where('account_id', $oldTargetAccount)->decrement('balance', $oldAmount);
-      }
-
-      // Perbarui transaksi dengan data baru
-      $transaction->update($request->only(['date', 'type', 'account_id', 'category_id', 'target_account_id', 'amount', 'descriptions']));
-
-      // Perbarui saldo sesuai transaksi baru
-      if ($request->type === 'pemasukan') {
-        Balance::where('account_id', $request->account_id)->increment('balance', $request->amount);
-      } elseif ($request->type === 'pengeluaran') {
-        Balance::where('account_id', $request->account_id)->decrement('balance', $request->amount);
-      } elseif ($request->type === 'pindah') {
-        Balance::where('account_id', $request->account_id)->decrement('balance', $request->amount);
-        Balance::where('account_id', $request->target_account_id)->increment('balance', $request->amount);
-      }
-    });
-
-    return redirect()->route('transaksi')->with('success', 'Transaksi berhasil diperbarui');
-  }
-
-
-  public function destroy($id): RedirectResponse
-  {
-    $transaction = Transaction::findOrFail($id);
-    $accountId = $transaction->account_id;
-    $targetAccountId = $transaction->target_account_id;
-
-    $balance = Balance::where('account_id', $accountId)->firstOrFail();
-
-    if ($transaction->type === 'pemasukan') {
-      $balance->balance -= $transaction->amount;
-    } elseif ($transaction->type === 'pengeluaran' || $transaction->type === 'pindah') {
-      $balance->balance += $transaction->amount;
+        return redirect()->route('transaksi')->with('success', 'Transaksi berhasil diperbarui');
     }
 
-    $balance->save();
-
-    if ($transaction->type === 'pindah' && $targetAccountId) {
-      $targetBalance = Balance::where('account_id', $targetAccountId)->first();
-
-      if ($targetBalance) {
-        $targetBalance->balance -= $transaction->amount;
-        $targetBalance->save();
-      }
+    public function destroy(string $id): RedirectResponse
+    {
+        Transaction::findOrFail($id)->delete(); // soft delete; saldo akun dihitung dari transaksi, tidak perlu disesuaikan
+        return back()->with('success', 'Transaksi berhasil dihapus!');
     }
 
-    $transaction->delete();
+    // ---------- Import Excel ----------
+    public function import(): View
+    {
+        return view('transaksi.import');
+    }
 
-    return redirect()->route('transaksi')->with('success', 'Transaksi berhasil dihapus!');
-  }
+    public function importStore(Request $request): RedirectResponse
+    {
+        $request->validate(['file' => ['required', 'file', 'mimes:xlsx,xls,csv', 'max:5120']]);
+
+        $import = new TransactionsImport();
+        Excel::import($import, $request->file('file'));
+
+        return redirect()->route('transaksi')
+            ->with('success', "{$import->imported} baris berhasil diimpor.")
+            ->with('import_errors', $import->errors);
+    }
+
+    public function template()
+    {
+        return Excel::download(new TemplateExport(), 'template-transaksi.xlsx');
+    }
+
+    // ---------- helpers ----------
+    private function formData(?Transaction $transaction): array
+    {
+        return [
+            'transaction' => $transaction,
+            'accounts'    => Account::orderBy('name')->get(['id', 'name']),
+            'categories'  => Category::orderBy('name')->get(['id', 'name', 'type']),
+        ];
+    }
+
+    private function validated(Request $request): array
+    {
+        // nominal boleh ditulis "120 K", "1,5jt", "50.000"
+        $request->merge(['amount' => AmountParser::parse($request->input('amount'))]);
+
+        $data = $request->validate([
+            'date'              => ['required', 'date'],
+            'type'              => ['required', Rule::in(Transaction::TYPES)],
+            'account_id'        => ['required', 'exists:accounts,id'],
+            'target_account_id' => ['nullable', 'required_if:type,pindah', 'exists:accounts,id', 'different:account_id'],
+            'category_id'       => ['nullable', 'exists:categories,id'],
+            'title'             => ['nullable', 'string', 'max:255'],
+            'quantity'          => ['nullable', 'numeric', 'min:0'],
+            'unit'              => ['nullable', 'string', 'max:20'],
+            'amount'            => ['required', 'integer', 'min:1'],
+            'descriptions'      => ['nullable', 'string'],
+        ], ['amount.required' => 'Jumlah tidak valid (contoh: 120000 atau 120 K).']);
+
+        if ($data['type'] !== Transaction::MOVE) {
+            $data['target_account_id'] = null;
+        }
+        return $data;
+    }
 }

@@ -2,63 +2,49 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Category;
+use App\Models\Account;
+use App\Models\TelegramMessage;
 use App\Models\Transaction;
-use Illuminate\Http\Request;
 use Illuminate\View\View;
-use App\Models\Balance;
 
 class DashboardController extends Controller
 {
-  public function index(): View
-  {
-    // 1️⃣ Data saldo akun
-    $balances = Balance::with('account')->get();
+    public function index(): View
+    {
+        $accounts = Account::withBalances()->get();
+        $monthRange = [now()->startOfMonth()->toDateString(), now()->endOfMonth()->toDateString()];
 
-    $chartData = [
-      'labels' => $balances->pluck('account.name')->toArray(),
-      'data' => $balances->pluck('balance')->toArray(),
-      'ids' => $balances->pluck('account.id')->toArray(),
-      'total' => $balances->sum('balance'),
-    ];
+        return view('dashboard', [
+            'totalBalance'      => $accounts->sum('balance'),
+            'monthIncome'       => Transaction::where('type', Transaction::IN)->whereBetween('date', $monthRange)->sum('amount'),
+            'monthExpense'      => Transaction::where('type', Transaction::OUT)->whereBetween('date', $monthRange)->sum('amount'),
+            'pendingChats'      => TelegramMessage::whereIn('parse_status', ['pending', 'failed'])->count(),
+            'chartData'         => [
+                'labels' => $accounts->pluck('name'),
+                'data'   => $accounts->pluck('balance')->map(fn ($v) => (int) $v),
+                'ids'    => $accounts->pluck('id'),
+            ],
+            'chartIncomeData'   => $this->byCategory(Transaction::IN),
+            'chartExpenseData'  => $this->byCategory(Transaction::OUT),
+            'totalIncome'       => Transaction::where('type', Transaction::IN)->sum('amount'),
+            'totalExpense'      => Transaction::where('type', Transaction::OUT)->sum('amount'),
+        ]);
+    }
 
-    // 2️⃣ Data pengeluaran
-    $salaryCategoryId = Category::where('name', 'gaji')->value('id');
+    private function byCategory(string $type): array
+    {
+        $rows = Transaction::query()
+            ->where('transactions.type', $type)
+            ->leftJoin('categories', 'categories.id', '=', 'transactions.category_id')
+            ->selectRaw("categories.id AS category_id, COALESCE(categories.name, 'Tanpa kategori') AS name, SUM(transactions.amount) AS total")
+            ->groupBy('categories.id', 'categories.name')
+            ->orderByDesc('total')
+            ->get();
 
-    $expenses = Transaction::where('type', 'pengeluaran')
-      ->where('category_id', '!=', $salaryCategoryId)
-      ->with('category')
-      ->selectRaw('category_id, SUM(amount) as total')
-      ->groupBy('category_id')
-      ->get();
-
-    $chartExpenseData = [
-      'labels' => $expenses->pluck('category.name')->toArray(),
-      'data' => $expenses->pluck('total')->toArray(),
-      'ids' => $expenses->pluck('category.id')->toArray(),
-    ];
-
-    // 3️⃣ Data pemasukan
-    $incomes = Transaction::where('type', 'pemasukan')
-      ->with('category')
-      ->selectRaw('category_id, SUM(amount) as total')
-      ->groupBy('category_id')
-      ->get();
-
-    $chartIncomeData = [
-      'labels' => $incomes->pluck('category.name')->toArray(),
-      'data' => $incomes->pluck('total')->toArray(),
-      'ids' => $incomes->pluck('category.id')->toArray(),
-    ];
-
-    // 4️⃣ Kirim langsung tanpa json_encode
-    return view('dashboard', [
-      'chartData' => $chartData,
-      'chartExpenseData' => $chartExpenseData,
-      'chartIncomeData' => $chartIncomeData,
-      'totalBalance' => $chartData['total'],
-      'totalIncome' => Transaction::where('type', 'pemasukan')->sum('amount'),
-      'totalExpense' => Transaction::where('type', 'pengeluaran')->sum('amount'),
-    ]);
-  }
+        return [
+            'labels' => $rows->pluck('name'),
+            'data'   => $rows->pluck('total')->map(fn ($v) => (int) $v),
+            'ids'    => $rows->pluck('category_id'),
+        ];
+    }
 }
